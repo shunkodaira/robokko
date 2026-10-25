@@ -23,11 +23,24 @@
 #include "img_guruguru.h"
 
 static const int SERVO_PIN = 2;      // Grove G2
+#ifdef NEKO_WIGGLE
+// Cat-octopus: one servo yaws the tentacles and the tail together.
+// A single press plays a short wiggle and returns to center.
+static const int WIGGLE_CENTER = 90;
+static const int WIGGLE_SWING = 28;
+static const int SWEEP_MIN_ANGLE = WIGGLE_CENTER - WIGGLE_SWING;
+static const int SWEEP_MAX_ANGLE = WIGGLE_CENTER + WIGGLE_SWING;
+static const int SWEEP_STEP_DEG = 2;
+static const unsigned long SWEEP_INTERVAL_MS = 25;
+static const int REST_ANGLE = WIGGLE_CENTER;
+static const int WIGGLE_LEGS = 6;
+#else
 static const int SWEEP_MIN_ANGLE = 20;
 static const int SWEEP_MAX_ANGLE = 65;
 static const int SWEEP_STEP_DEG = 2; // degrees moved per update
 static const unsigned long SWEEP_INTERVAL_MS = 25;
 static const int REST_ANGLE = SWEEP_MAX_ANGLE; // position when OFF
+#endif
 
 static const float ORIENTATION_MARGIN_G = 0.15f;  // hysteresis between portrait/landscape
 static const unsigned long LANDSCAPE_SLEEP_HOLD_MS = 2000; // landscape must hold this long (while sweeping) to pause+sleep
@@ -35,7 +48,11 @@ static const float SHAKE_THRESHOLD_G = 1.4f;      // deviation from 1g that coun
 static const unsigned long SHAKE_DISPLAY_MS = 800;
 
 static const unsigned long ARROW_DISPLAY_MS = 800;
+#ifdef NEKO_WIGGLE
+static const int DOUBLE_CLICK_ANGLE = WIGGLE_CENTER;
+#else
 static const int DOUBLE_CLICK_ANGLE = 20;         // every double-click commands this same position
+#endif
 
 // Idle animation shown while sweeping, picked randomly (weighted) each time a pattern finishes.
 struct AnimStep {
@@ -67,6 +84,9 @@ unsigned long lastShakeMs = 0;
 unsigned long lastDoubleClickMs = 0;
 bool shakeActive = false;
 bool arrowActive = false;
+#ifdef NEKO_WIGGLE
+int wiggleLegsLeft = 0;
+#endif
 
 static const uint16_t *IMAGE_ARROW = reinterpret_cast<const uint16_t *>(1); // sentinel: procedurally drawn, not pushImage'd
 const uint16_t *currentImage = nullptr;
@@ -136,6 +156,14 @@ void loop() {
     M5.update();
 
     if (M5.BtnA.wasSingleClicked()) {
+#ifdef NEKO_WIGGLE
+        sweeping = true;
+        returningToRest = false;
+        sweepPaused = false;
+        wiggleLegsLeft = WIGGLE_LEGS;
+        animPatternIndex = -1;
+        if (angle == REST_ANGLE) direction = -1;
+#else
         sweeping = !sweeping;
         if (sweeping) {
             returningToRest = false; // resume actively right away
@@ -144,10 +172,17 @@ void loop() {
         } else {
             returningToRest = true; // ease down to REST_ANGLE instead of snapping
         }
+#endif
     }
     if (M5.BtnA.wasDoubleClicked()) {
         lastDoubleClickMs = millis();
         arrowActive = true;
+#ifdef NEKO_WIGGLE
+        sweeping = false;
+        returningToRest = false;
+        sweepPaused = false;
+        wiggleLegsLeft = 0;
+#endif
         // Keep the next sweep/return step relative to the last commanded position.
         angle = DOUBLE_CLICK_ANGLE;
         direction = (angle == REST_ANGLE) ? -1 : 1;
@@ -227,9 +262,21 @@ void loop() {
             if (angle >= SWEEP_MAX_ANGLE) {
                 angle = SWEEP_MAX_ANGLE;
                 direction = -1;
+#ifdef NEKO_WIGGLE
+                if (wiggleLegsLeft > 0 && --wiggleLegsLeft == 0) {
+                    sweeping = false;
+                    returningToRest = true;
+                }
+#endif
             } else if (angle <= SWEEP_MIN_ANGLE) {
                 angle = SWEEP_MIN_ANGLE;
                 direction = 1;
+#ifdef NEKO_WIGGLE
+                if (wiggleLegsLeft > 0 && --wiggleLegsLeft == 0) {
+                    sweeping = false;
+                    returningToRest = true;
+                }
+#endif
             }
             servo.write(angle);
         }
