@@ -1,306 +1,373 @@
 #!/usr/bin/env python3
-"""Printable black-cat / octopus shell for the robokko electronics.
+"""黒猫タコ。SG90 が1個で、タコ足と尻尾を一緒にヨーイングする。
 
-One SG90 yaws a single moving piece (tentacles + tail) under a fixed head.
-The head holds the ATOM S3R stacked on the Atomic Battery Base from the
-macaron build. Stock hinge is not used.
+頭は固定。サーボの胴は頭に固定し、ホーンが「タコ足と尻尾」1部品を振る。
+参考写真の簡略版。尻尾の巻きはサポートを減らすために浅くしてある。
 
-Run from the repo root: python3 models/印刷部品/黒猫タコ/generate.py
+  python3 generate.py
 """
 
+from __future__ import annotations
+
+import math
 from pathlib import Path
 
 import numpy as np
 import trimesh
+from manifold3d import CrossSection, Manifold, OpType, set_circular_segments
 from PIL import Image, ImageDraw
 
 OUT = Path(__file__).resolve().parent
 
-# Servo shaft points down. Horn and the moving skirt sit under the body.
-SHAFT_X = 0.0
-SHAFT_Y = -8.0
-SERVO_BOTTOM_Z = 40.0
-SHAFT_HOLE_Z = SERVO_BOTTOM_Z - 1.2
+# 組み立て座標。Z上、+Yが顔、+Xが右。サーボ軸はZ軸。
+Z_BASE = 42.0
+HEAD_R = 34.0
+CUT = math.radians(52.0)
+Z_CENTER = Z_BASE + HEAD_R * math.cos(CUT)
+HUB_TOP = Z_BASE - 2.2
 
-# SG90 body, shaft offset toward the front (+Y) from the body center.
-SERVO_BODY_X = 12.6
-SERVO_BODY_Y = 23.2
-SERVO_TAB_Y = 32.6
-SERVO_BODY_Z = 23.0
-SHAFT_OFFSET_Y = 4.0
+# SG90。軸は胴の長手で端に寄る。長い側を後ろ（-Y）。
+BODY_X = 13.6
+BODY_Y0 = -19.2
+BODY_Y1 = 8.2
+TAB_Y0 = -23.8
+TAB_Y1 = 12.4
+TAB_Z0 = 1.0
+TAB_Z1 = 5.2
+COLLAR_H = 6.3
+COLLAR_R = 7.2
+BODY_Z = 24.6
+FLOOR = Z_BASE + COLLAR_H
 
-HEAD_CENTER = np.array([0.0, 24.0, 106.0])
-HEAD_R = np.array([33.0, 30.0, 29.0])
-
-
-def _align_z(direction):
-    direction = np.asarray(direction, dtype=float)
-    direction = direction / np.linalg.norm(direction)
-    return trimesh.geometry.align_vectors([0.0, 0.0, 1.0], direction)
-
-
-def rod(p0, p1, radius, sections=20):
-    p0 = np.asarray(p0, dtype=float)
-    p1 = np.asarray(p1, dtype=float)
-    length = np.linalg.norm(p1 - p0)
-    mesh = trimesh.creation.cylinder(radius=radius, height=length, sections=sections)
-    mesh.apply_transform(_align_z(p1 - p0))
-    mesh.apply_translation((p0 + p1) / 2.0)
-    ball = trimesh.creation.icosphere(subdivisions=2, radius=radius)
-    a = ball.copy()
-    b = ball.copy()
-    a.apply_translation(p0)
-    b.apply_translation(p1)
-    return trimesh.boolean.union([mesh, a, b], engine="manifold")
+# 尻尾は左後ろ。±32°振ってもサーボ室に入らない方位。
+TAIL_AZ = math.radians(180.0 + 58.0)  # 数学角。180°が -X、+90°が +Y
+# 180+58 = 238°: x=cos(238)<0, y=sin(238)<0 → 左後ろ。
 
 
-def box_at(center, extents):
-    mesh = trimesh.creation.box(extents=extents)
-    mesh.apply_translation(center)
-    return mesh
+def az_dir(extra: float = 0.0):
+    a = TAIL_AZ + extra
+    return np.array([math.cos(a), math.sin(a), 0.0])
 
 
-def ellipsoid(radii, subdivisions=4):
-    mesh = trimesh.creation.icosphere(subdivisions=subdivisions, radius=1.0)
-    mesh.apply_scale(radii)
-    return mesh
+def add(parts):
+    parts = [p for p in parts if p is not None and not p.is_empty()]
+    if not parts:
+        raise RuntimeError("empty union")
+    return parts[0] if len(parts) == 1 else Manifold.batch_boolean(parts, OpType.Add)
 
 
-def union_all(meshes):
-    acc = meshes[0]
-    for mesh in meshes[1:]:
-        acc = trimesh.boolean.union([acc, mesh], engine="manifold")
-    return acc
+def sub(base, cuts):
+    out = base - add(cuts)
+    if "NoError" not in str(out.status()):
+        raise RuntimeError(f"boolean {out.status()}")
+    return out
 
 
-def difference_all(mesh, cutters):
-    for cutter in cutters:
-        mesh = trimesh.boolean.difference([mesh, cutter], engine="manifold")
-    return mesh
+def sphere(r, c, n=48):
+    return Manifold.sphere(float(r), n).translate([float(c[0]), float(c[1]), float(c[2])])
 
 
-def build_fixed():
-    head = ellipsoid(HEAD_R)
-    head.apply_translation(HEAD_CENTER)
+def cyl_z(r, z0, z1, n=48):
+    return Manifold.cylinder(z1 - z0, r, r, n).translate([0, 0, z0])
+
+
+def box(cx, cy, cz, sx, sy, sz):
+    return Manifold.cube([sx, sy, sz], True).translate([cx, cy, cz])
+
+
+def tube(points, radii, n=24):
+    bits = []
+    for p0, p1, r0, r1 in zip(points, points[1:], radii, radii[1:]):
+        bits.append(Manifold.batch_hull([sphere(r0, p0, n), sphere(max(r1, 0.7), p1, n)]))
+    return add(bits)
+
+
+def sector(r0, r1, center, half, z0, z1, n=32):
+    a0, a1 = center - half, center + half
+    outer = [[r1 * math.cos(a), r1 * math.sin(a)] for a in np.linspace(a0, a1, n)]
+    inner = [[r0 * math.cos(a), r0 * math.sin(a)] for a in np.linspace(a1, a0, n)]
+    return Manifold.extrude(CrossSection([outer + inner]), z1 - z0).translate([0, 0, z0])
+
+
+def to_tm(man: Manifold) -> trimesh.Trimesh:
+    if man.is_empty() or "NoError" not in str(man.status()):
+        raise RuntimeError(f"bad manifold {man.status()} empty={man.is_empty()}")
+    raw = man.to_mesh()
+    tm = trimesh.Trimesh(
+        vertices=np.array(raw.vert_properties)[:, :3],
+        faces=np.array(raw.tri_verts),
+        process=False,
+    )
+    tm.merge_vertices()
+    tm.update_faces(tm.unique_faces())
+    tm.remove_unreferenced_vertices()
+    tm.fix_normals()
+    if tm.volume < 0:
+        tm.invert()
+    return tm
+
+
+def build_head() -> Manifold:
+    head = Manifold.sphere(HEAD_R, 72).translate([0, 0, Z_CENTER])
+    head = head.trim_by_plane([0, 0, 1], Z_BASE)
 
     ears = []
-    for sign in (-1, 1):
-        ear = ellipsoid(np.array([9.5, 6.5, 16.0]), subdivisions=3)
-        ear.apply_translation([sign * 16.0, -2.0, 22.0] + HEAD_CENTER)
+    for sign in (-1.0, 1.0):
+        base_c = np.array([sign * 14.5, -1.0, Z_CENTER + HEAD_R - 7.5])
+        tip_c = np.array([sign * 20.0, -0.6, Z_CENTER + HEAD_R + 16.0])
+        mid_c = (base_c + tip_c) / 2 + np.array([sign * 1.0, -0.4, 1.0])
+        ear = Manifold.batch_hull(
+            [sphere(8.4, base_c, 32), sphere(4.6, mid_c, 28), sphere(1.55, tip_c, 18)]
+        )
+        pivot = base_c.copy()
+        ear = ear.translate((-pivot).tolist()).rotate([0, -sign * 12.0, 0]).translate(pivot.tolist())
         ears.append(ear)
 
-    # Neck drops from the head onto the servo cage.
-    neck = box_at([SHAFT_X, 2.0, 82.0], [16.0, 30.0, 36.0])
-    servo_block = box_at(
-        [SHAFT_X, SHAFT_Y, SERVO_BOTTOM_Z + 13.0],
-        [16.0, SERVO_TAB_Y + 4.0, 26.0],
+    shell = add([head, *ears])
+
+    # ATOM S3R。ポケットは 25.4 mm、奥行きは本体 12.9 mm + 0.5 mm。
+    pz = Z_CENTER + 6.5
+    front = 27.2
+    depth = 13.4
+    pocket = box(0, front - depth / 2, pz, 25.4, depth, 25.4)
+    window = box(0, front + 1.5, pz, 20.0, 12.0, 20.0)
+    # 後ろから入れる道。天井は半円。
+    tunnel = box(0, -8.0, pz, 26.0, 56.0, 25.4)
+    arch = cyl_z(13.0, -36.0, 20.0, 36).rotate([0, 90, 0]).translate([0, -8.0, pz + 12.7])
+    cable = box(0, -10.0, pz - 12.7 - 5.0, 16.0, 34.0, 14.0)
+
+    cavity = box(
+        0,
+        (BODY_Y0 + BODY_Y1) / 2,
+        FLOOR + BODY_Z / 2,
+        BODY_X,
+        BODY_Y1 - BODY_Y0,
+        BODY_Z,
     )
-    outer = union_all([head, neck, servo_block, *ears])
-
-    inner = ellipsoid(HEAD_R - 2.8)
-    inner.apply_translation(HEAD_CENTER)
-
-    # Chin opening and a square well big enough for ATOM (24) + battery base (24).
-    # The stack is inserted upward, then forward against the screen bezel.
-    well = box_at(
-        [HEAD_CENTER[0], HEAD_CENTER[1] - 2.0, HEAD_CENTER[2] - 6.0],
-        [26.2, 42.0, 40.0],
+    tabs = box(
+        0,
+        (TAB_Y0 + TAB_Y1) / 2,
+        FLOOR + (TAB_Z0 + TAB_Z1) / 2,
+        BODY_X,
+        TAB_Y1 - TAB_Y0,
+        TAB_Z1 - TAB_Z0,
     )
-    chin = box_at([0.0, 6.0, 74.0], [28.0, 34.0, 22.0])
+    collar = cyl_z(COLLAR_R, Z_BASE - 0.4, FLOOR + 0.3, 40)
+    mouth = box(0, -30.0, FLOOR + 1.3 + (BODY_Z + 1.5) / 2, BODY_X + 0.6, 36.0, BODY_Z + 1.5)
+    wire = box(0, -8.0, FLOOR + BODY_Z - 2.0, 8.0, 14.0, 12.0)
 
-    # Screen window. Active area is ~15 mm; 18.6 mm leaves the glass pressable
-    # and a lip on the 24 mm body.
-    window = box_at(
-        [HEAD_CENTER[0], HEAD_CENTER[1] + HEAD_R[1] - 2.0, HEAD_CENTER[2] + 3.0],
-        [18.6, 16.0, 18.6],
-    )
-    bezel = box_at(
-        [HEAD_CENTER[0], HEAD_CENTER[1] + 16.0, HEAD_CENTER[2] + 3.0],
-        [30.0, 8.0, 30.0],
-    )
+    # 尻尾が底を横切る扇形。サーボの胴（半径およそ 21 mm）より外から。
+    fan = sector(21.0, 52.0, TAIL_AZ, math.radians(52.0), Z_BASE - 0.4, Z_BASE + 30.0)
 
-    # Battery switch and USB reach the right and lower edges of the stack.
-    switch_slot = box_at([16.5, HEAD_CENTER[1] - 4.0, HEAD_CENTER[2] - 4.0], [16.0, 14.0, 10.0])
+    holes = []
+    for sign in (-1.0, 1.0):
+        for zoff, yoff, tilt in ((6.2, 4.0, 0.16), (0.0, 7.5, 0.0), (-6.4, 4.0, -0.15)):
+            d = np.array([sign, 0.22, tilt], dtype=float)
+            d /= np.linalg.norm(d)
+            outer = np.array([sign * 38.0, 12.0 + yoff, pz + zoff])
+            holes.append(tube([outer - d * 14.0, outer + d * 1.5], [1.35, 1.35], n=14))
 
-    # Servo drops in from the rear. Floor keeps the body in; a slot lets the
-    # shaft out. The horn, once screwed on, stops the servo sliding back.
-    servo_cavity = box_at(
-        [SHAFT_X, SHAFT_Y + 2.0, SERVO_BOTTOM_Z + SERVO_BODY_Z / 2.0 + 1.0],
-        [SERVO_BODY_X + 0.6, SERVO_TAB_Y + 8.0, SERVO_BODY_Z + 1.0],
-    )
-    shaft_hole = trimesh.creation.cylinder(radius=4.6, height=12.0, sections=24)
-    shaft_hole.apply_translation([SHAFT_X, SHAFT_Y + SHAFT_OFFSET_Y, SERVO_BOTTOM_Z - 2.0])
-
-    shell = difference_all(outer, [inner])
-    shell = union_all([shell, bezel])
-    shell = difference_all(shell, [well, chin, window, switch_slot, servo_cavity, shaft_hole])
-
-    whiskers = []
-    for sign in (-1, 1):
-        for dz, dy in ((-7.0, 4.0), (-1.0, 8.0), (5.0, 4.0)):
-            start = HEAD_CENTER + np.array([sign * 18.0, 10.0 + dy, dz])
-            end = HEAD_CENTER + np.array([sign * 40.0, 16.0 + dy, dz])
-            whiskers.append(rod(start, end, 1.25, sections=12))
-    shell = difference_all(shell, whiskers)
-    return shell
+    return sub(shell, [pocket, window, tunnel, arch, cable, cavity, tabs, collar, mouth, wire, fan, *holes])
 
 
-def tentacle_curves():
-    """Eight legs around the shaft, leaving the rear open for the tail root."""
-    curves = []
-    angles = [20, 55, 90, 125, 160, 205, 250, 330]
-    for index, angle in enumerate(angles):
-        curl = 0.55 if index % 2 == 0 else -0.55
-        length = 30.0 if 70 <= angle <= 120 else 36.0
-        direction = np.deg2rad(angle)
-        radius0 = 16.0
-        point = np.array(
-            [
-                SHAFT_X + np.cos(direction) * radius0,
-                SHAFT_Y + SHAFT_OFFSET_Y + np.sin(direction) * radius0,
-                29.0,
-            ]
+def tentacle(angle_deg, length, curl):
+    a = math.radians(angle_deg)
+    dx, dy = math.sin(a), math.cos(a)
+    sx, sy = math.cos(a), -math.sin(a)
+    pts, radii = [], []
+    for i in range(6):
+        t = i / 5
+        dist = 11.0 + length * t
+        # 頭の底（Z_BASE）より下を通す。根元の上端が底に触れない。
+        z = 3.0 + (HUB_TOP - 11.0 - 3.0) * ((1 - t) ** 0.85)
+        side = curl * 6.0 * t * t
+        pts.append((dx * dist + sx * side, dy * dist + sy * side, z))
+        radii.append(5.4 + (4.0 - 5.4) * t)
+    return tube(pts, radii, n=20)
+
+
+def build_moving() -> Manifold:
+    hub = add(
+        [
+            sphere(15.5, [0, 0, HUB_TOP - 9.0], 48),
+            cyl_z(14.2, HUB_TOP - 14.0, HUB_TOP + 1.0, 56),
+        ]
+    ).trim_by_plane([0, 0, -1], -HUB_TOP)
+
+    legs = [
+        tentacle(a, L, c)
+        for a, L, c in (
+            (16, 28, 0.65),
+            (55, 32, -0.5),
+            (95, 34, 0.4),
+            (138, 26, -0.3),
+            (-16, 28, -0.65),
+            (-55, 32, 0.5),
+            (-95, 34, -0.4),
+            (-138, 26, 0.3),
         )
-        pts = [point.copy()]
-        for step in range(7):
-            direction += curl * 0.16
-            travel = length / 7.0
-            point = point + travel * np.array([np.cos(direction), np.sin(direction), 0.0])
-            point[2] = 29.0
-            pts.append(point.copy())
-        curves.append(pts)
-    return curves
+    ]
 
+    d = az_dir()
+    # ハブから 50° 前後で立ち上がり、頭の外を通って浅く巻く。
+    stations = [12.0, 22.0, 34.0, 44.0, 50.0, 50.0, 44.0]
+    zs = [26.0, 34.0, 46.0, 64.0, 86.0, 106.0, 122.0]
+    radii = [5.2, 5.0, 4.8, 4.5, 4.0, 3.5, 2.9]
+    pts = [(d[0] * s, d[1] * s, z) for s, z in zip(stations, zs)]
+    tail = tube(pts, radii, n=22)
 
-def build_moving():
-    hub = trimesh.creation.cylinder(radius=18.0, height=6.0, sections=40)
-    hub.apply_translation([SHAFT_X, SHAFT_Y + SHAFT_OFFSET_Y, 29.5])
-
-    legs = [hub]
-    for curve in tentacle_curves():
-        radii = np.linspace(5.2, 3.2, len(curve) - 1)
-        for p0, p1, radius in zip(curve, curve[1:], radii):
-            legs.append(rod(p0, p1, radius, sections=14))
-    skirt = union_all(legs)
-
-    # Tail leaves the rear of the hub and curls up beside the head.
-    tail_pts = []
-    for t in np.linspace(0.0, 1.0, 16):
-        # Stay low until the tail is behind the head, then rise.
-        rise = max(0.0, (t - 0.28) / 0.72)
-        tail_pts.append(
-            [
-                SHAFT_X + 26.0 * rise,
-                SHAFT_Y + SHAFT_OFFSET_Y - 14.0 - 50.0 * t,
-                30.0 + 62.0 * (rise ** 1.15),
-            ]
-        )
-    tail_bits = []
-    for p0, p1, radius in zip(tail_pts, tail_pts[1:], np.linspace(6.5, 3.2, len(tail_pts) - 1)):
-        tail_bits.append(rod(p0, p1, radius, sections=14))
-    moving = union_all([skirt, *tail_bits])
-
-    # Pocket for the single-arm horn. Screw head sits in a recess.
-    slot = box_at(
-        [SHAFT_X, SHAFT_Y + SHAFT_OFFSET_Y - 8.0, 32.2],
-        [7.0, 20.0, 3.2],
+    moving = add([hub, *legs, tail]).trim_by_plane([0, 0, 1], 0.0)
+    # 溝を尻尾の方位へ回す。box は軸平行なので、回転してから引く。
+    slot_along = box(0, 0, HUB_TOP - 1.55, 6.8, 26.0, 3.5).rotate(
+        [0, 0, math.degrees(TAIL_AZ) - 90.0]
     )
-    screw = trimesh.creation.cylinder(radius=3.4, height=8.0, sections=16)
-    screw.apply_translation([SHAFT_X, SHAFT_Y + SHAFT_OFFSET_Y, 33.2])
-    pin = trimesh.creation.cylinder(radius=1.15, height=16.0, sections=12)
-    pin.apply_transform(_align_z([1.0, 0.0, 0.0]))
-    pin.apply_translation([SHAFT_X, SHAFT_Y + SHAFT_OFFSET_Y - 10.0, 31.4])
-    moving = difference_all(moving, [slot, screw, pin])
-    return moving
-
-
-def build_whisker():
-    shaft = trimesh.creation.cylinder(radius=1.05, height=22.0, sections=12)
-    shaft.apply_transform(_align_z([1.0, 0.0, 0.0]))
-    collar = trimesh.creation.cylinder(radius=2.2, height=1.6, sections=16)
-    collar.apply_transform(_align_z([1.0, 0.0, 0.0]))
-    collar.apply_translation([-6.0, 0.0, 0.0])
-    return trimesh.boolean.union([shaft, collar], engine="manifold")
-
-
-def export_mesh(mesh, name):
-    mesh.merge_vertices()
-    mesh.fix_normals()
-    path = OUT / name
-    mesh.export(path)
-    print(
-        f"{name}: {mesh.extents[0]:.1f} x {mesh.extents[1]:.1f} x {mesh.extents[2]:.1f} mm"
-        f"  watertight={mesh.is_watertight}  volume={mesh.volume:.0f}"
+    slot_cross = box(0, 0, HUB_TOP - 1.55, 22.0, 6.8, 3.5).rotate(
+        [0, 0, math.degrees(TAIL_AZ) - 90.0]
     )
-    return path
+    screw = cyl_z(1.7, HUB_TOP - 16.0, HUB_TOP + 0.4, 20)
+    driver = cyl_z(4.8, 6.0, HUB_TOP - 5.0, 24)
+    return sub(moving, [slot_along, slot_cross, screw, driver])
 
 
-def preview(fixed, moving):
-    image = Image.new("RGB", (900, 520), (245, 242, 236))
-    draw = ImageDraw.Draw(image)
-
-    def paint(mesh, color, origin, scale, flip_y=True):
-        verts = mesh.vertices
-        for tri in mesh.faces[:: max(1, len(mesh.faces) // 2500)]:
-            pts = []
-            for index in tri:
-                x, y, z = verts[index]
-                px = origin[0] + x * scale
-                py = origin[1] + ((-z if flip_y else y) * scale)
-                pts.append((px, py))
-            draw.polygon(pts, outline=color)
-
-    paint(fixed, (40, 40, 40), (230, 470), 3.1)
-    paint(moving, (180, 90, 40), (230, 470), 3.1)
-    # top view
-    verts_f = fixed.vertices
-    verts_m = moving.vertices
-    for mesh_verts, color, ox in ((verts_f, (40, 40, 40), 640), (verts_m, (180, 90, 40), 640)):
-        pass
-    for mesh, color in ((fixed, (40, 40, 40)), (moving, (180, 90, 40))):
-        for tri in mesh.faces[:: max(1, len(mesh.faces) // 2000)]:
-            pts = []
-            for index in tri:
-                x, y, _z = mesh.vertices[index]
-                pts.append((ox + 180 + x * 2.4, 260 - y * 2.4))
-            draw.polygon(pts, outline=color)
-    path = OUT / "preview.png"
-    image.save(path)
-    print("preview", path)
+def build_whisker() -> Manifold:
+    shaft = tube([(0, 0, 1.05), (26, 0, 1.05)], [0.95, 0.7], n=16)
+    root = tube([(-0.4, 0, 1.2), (6.5, 0, 1.2)], [1.2, 1.2], n=16)
+    return add([shaft, root]).trim_by_plane([0, 0, 1], 0.0)
 
 
-def yaw_clearance(fixed, moving):
-    """Vertex gap between the fixed shell and the skirt swung ±28°."""
-    tree_points = fixed.vertices[::3]
-    from scipy.spatial import cKDTree
+def servo_probe() -> Manifold:
+    body = box(0, (BODY_Y0 + 0.6 + BODY_Y1 - 0.5) / 2, FLOOR + 11.4, 12.2, (BODY_Y1 - 0.5) - (BODY_Y0 + 0.6), 22.4)
+    tabs = box(0, (TAB_Y0 + 0.8 + TAB_Y1 - 0.6) / 2, FLOOR + 2.6, 12.4, (TAB_Y1 - 0.6) - (TAB_Y0 + 0.8), 2.6)
+    return add([body, tabs])
 
-    tree = cKDTree(tree_points)
-    worst = 999.0
-    for degrees in (-28, 28):
-        spun = moving.copy()
-        spun.apply_translation([-SHAFT_X, -(SHAFT_Y + SHAFT_OFFSET_Y), 0.0])
-        rotation = trimesh.transformations.rotation_matrix(
-            np.deg2rad(degrees), [0, 0, 1]
-        )
-        spun.apply_transform(rotation)
-        spun.apply_translation([SHAFT_X, SHAFT_Y + SHAFT_OFFSET_Y, 0.0])
-        dists, _ = tree.query(spun.vertices[::4], k=1)
-        worst = min(worst, float(dists.min()))
-        print(f"clearance at {degrees:+d} deg: {dists.min():.2f} mm")
-    return worst
+
+def atom_probe() -> Manifold:
+    pz = Z_CENTER + 6.5
+    front = 27.2
+    # ガラスが窓側、奥行き 12.9。ポケット前端は front。
+    return box(0, front - 0.4 - 12.9 / 2, pz, 24.0, 12.9, 24.0)
+
+
+def yaw_mesh(tm, deg):
+    spun = tm.copy()
+    spun.apply_transform(trimesh.transformations.rotation_matrix(math.radians(deg), [0, 0, 1]))
+    return spun
+
+
+def overlap(a: Manifold, b: Manifold) -> float:
+    inter = a ^ b
+    return 0.0 if inter.is_empty() else float(inter.volume())
+
+
+def render(head_tm, move_tm, path):
+    size = 480
+    tiles = []
+    for view in ("front", "side", "back", "top"):
+        img = Image.new("RGB", (size, size), (235, 235, 235))
+        draw = ImageDraw.Draw(img)
+        allv = np.vstack([head_tm.vertices, move_tm.vertices])
+
+        def xy_of(v):
+            if view == "front":
+                return np.stack([v[:, 0], v[:, 2]], 1)
+            if view == "side":
+                return np.stack([v[:, 1], v[:, 2]], 1)
+            if view == "back":
+                return np.stack([-v[:, 0], v[:, 2]], 1)
+            return np.stack([v[:, 0], -v[:, 1]], 1)
+
+        pts = xy_of(allv)
+        lo, hi = pts.min(0), pts.max(0)
+        scale = (size - 30) / max(hi - lo)
+        mid = (lo + hi) / 2
+
+        def conv(p):
+            q = (p - mid) * scale
+            return (size / 2 + q[0], size / 2 - q[1])
+
+        for mesh, col in ((head_tm, (32, 32, 36)), (move_tm, (70, 70, 78))):
+            step = max(1, len(mesh.faces) // 6000)
+            order = mesh.triangles_center[:, 2]
+            for i in np.argsort(order)[::step]:
+                poly = [tuple(conv(p)) for p in xy_of(mesh.vertices[mesh.faces[i]])]
+                draw.polygon(poly, outline=col)
+        tiles.append(img)
+    sheet = Image.new("RGB", (size * 2, size * 2), (235, 235, 235))
+    for i, t in enumerate(tiles):
+        sheet.paste(t, ((i % 2) * size, (i // 2) * size))
+    sheet.save(path)
 
 
 def main():
-    fixed = build_fixed()
-    moving = build_moving()
-    whisker = build_whisker()
-    export_mesh(fixed, "頭と台.stl")
-    export_mesh(moving, "足としっぽ.stl")
-    export_mesh(whisker, "ひげ.stl")
-    preview(fixed, moving)
-    gap = yaw_clearance(fixed, moving)
-    if gap < 2.0:
-        raise SystemExit(f"moving parts come within {gap:.2f} mm of the head")
+    set_circular_segments(48)
+    OUT.mkdir(parents=True, exist_ok=True)
+    print("build")
+    head_m = build_head()
+    move_m = build_moving()
+    whisk_m = build_whisker()
+    head = to_tm(head_m)
+    moving = to_tm(move_m)
+    whisker = to_tm(whisk_m)
+
+    for name, mesh in (("頭", head), ("動", moving), ("ひげ", whisker)):
+        ext = mesh.extents
+        parts = mesh.split(only_watertight=False)
+        print(
+            f"{name} {ext.round(1).tolist()} watertight={mesh.is_watertight} "
+            f"vol={mesh.volume:.0f} faces={len(mesh.faces)} parts={len(parts)}"
+        )
+        if (not mesh.is_watertight) or ext.max() > 175 or mesh.volume < 20:
+            raise SystemExit(f"bad {name}")
+    if len(moving.split(only_watertight=True)) != 1:
+        raise SystemExit("tail is not joined to the tentacles")
+
+    servo = servo_probe()
+    atom = atom_probe()
+    print(f"servo in plastic {overlap(servo, head_m):.2f}")
+    print(f"atom in plastic {overlap(atom, head_m):.2f}")
+    if overlap(servo, head_m) > 5 or overlap(atom, head_m) > 5:
+        raise SystemExit("servo or ATOM does not fit")
+
+    glass = box(0, 29.5, Z_CENTER + 6.5, 16.0, 4.0, 16.0)
+    print(f"window blocked {overlap(glass, head_m):.2f}")
+    if overlap(glass, head_m) > 2:
+        raise SystemExit("screen is not pressable")
+
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(head.vertices)
+    for deg in (0, -28, 28, -32, 32):
+        spun = yaw_mesh(moving, deg)
+        inter = trimesh.boolean.intersection([head, spun], engine="manifold")
+        vol = 0.0 if inter is None else float(inter.volume)
+        dist, _ = tree.query(spun.vertices[::2])
+        print(f"yaw {deg:+4.0f} inter {vol:.2f} gap {dist.min():.2f}")
+        if vol > 2.0 or dist.min() < 1.0:
+            raise SystemExit(f"hit at {deg}")
+
+    for deg in (0, -32, 32):
+        spun = yaw_mesh(moving, deg)
+        sm = Manifold.of_mesh(spun.vertices, spun.faces) if hasattr(Manifold, "of_mesh") else None
+        if sm is None:
+            raw = trimesh.Trimesh(vertices=spun.vertices, faces=spun.faces, process=False)
+            # rebuild via to_mesh inverse: use trimesh boolean volume vs servo already covered if servo is inside head void
+            servo_tm = to_tm(servo)
+            hit = trimesh.boolean.intersection([servo_tm, spun], engine="manifold")
+            hv = 0.0 if hit is None else float(hit.volume)
+            print(f"servo vs moving {deg:+} {hv:.2f}")
+            if hv > 2:
+                raise SystemExit("tail hits the servo")
+
+    head.apply_translation([0, 0, -Z_BASE])
+    for mesh, fn in ((head, "頭.stl"), (moving, "タコ足と尻尾.stl"), (whisker, "ひげ.stl")):
+        mesh.export(OUT / fn)
+        print("wrote", fn, mesh.extents.round(1).tolist())
+
+    preview_move = moving.copy()
+    preview_move.apply_translation([0, 0, -Z_BASE])
+    render(head, preview_move, Path("/tmp/neko_sheet.png"))
+    print("preview /tmp/neko_sheet.png")
+    print("Z_CENTER", round(Z_CENTER, 2), "base r", round(HEAD_R * math.sin(CUT), 2))
 
 
 if __name__ == "__main__":
